@@ -1,0 +1,14 @@
+# Compiled Object files, libraries, and executables
+**/build/
+**/sdkconfig
+**/sdkconfig.old
+**/managed_components
+
+# Editor/IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Log files
+*.log
