@@ -12,10 +12,10 @@ Firmware for the AMBI PS-1 multi-sensor node. Reads from hardware sensors, filte
 ```
 zb_presence_sensor/
 ├── main/
-│   ├── ps1.c               # Application entry point. Registers event handlers, owns all Zigbee logic.
+│   ├── ps1.c               # Application entry point. Creates queues, spawns handler tasks, owns all Zigbee logic.
 │   └── ps1.h               # Pin definitions, Zigbee config constants.
 └── components/
-    ├── base_component/     # Skeleton template — copy this to start a new sensor component.
+    ├── uart_component/     # UART sensor template — copy this to start a new UART-based sensor component.
     ├── test_component/     # Reference implementation with simulated data. Use for development/testing.
     └── light_driver/       # LED strip output driver.
 ```
@@ -26,7 +26,7 @@ zb_presence_sensor/
 
 ### Core principle
 
-> **Components read hardware and emit events. Main decides what to do with them.**
+> **Components read hardware and enqueue data. Main decides what to do with it.**
 
 Components are completely unaware of the application. They do not call into `main`, do not touch Zigbee, and do not know about other components. Main owns all application logic.
 
@@ -44,31 +44,31 @@ Components are completely unaware of the application. They do not call into `mai
 │  1. Read raw data from hardware                      │
 │  2. Apply hardware-level filtering (debounce,        │
 │     delta threshold, rate limiting)                  │
-│  3. esp_event_post() on meaningful state change      │
+│  3. xQueueSend() on meaningful state change          │
 │  4. Update internal snapshot for poll (get_latest)   │
 └───────────┬──────────────────────────────────────────┘
-            │  esp_event (only on real state changes)
+            │  xQueue (only on real state changes)
             ▼
 ┌──────────────────────────────────────────────────────┐
-│               ESP-IDF Default Event Loop             │
+│             FreeRTOS Queue (one per component)       │
 └───────────┬──────────────────────────────────────────┘
-            │  dispatches to registered handlers
+            │  xQueueReceive() in handler task
             ▼
 ┌──────────────────────────────────────────────────────┐
 │                    ps1.c (main)                      │
 │                                                      │
-│  on_sensor_event()                                   │
+│  sensor_handler_task() / uart_handler_task()         │
 │  - Sensor fusion (combine readings from 2+ sensors)  │
 │  - Application decisions                             │
 │  - Update Zigbee attributes                          │
 └──────────────────────────────────────────────────────┘
 ```
 
-### Why `esp_event` and not `xQueue`
+### Queue-per-component pattern
 
-`xQueue` is one pipe with one reader — you need one queue per sensor. `esp_event` is a shared bus with a built-in dispatcher. Adding a new sensor means one new `esp_event_handler_register` call in `app_main`. No new tasks, no new queues.
+Each component receives a `QueueHandle_t` at init time (created by `main`). Main spawns one lightweight handler task per component that blocks on `xQueueReceive`. This keeps component logic isolated and lets each handler run at its own priority.
 
-If a sensor is high-throughput (e.g. raw radar frames at 100Hz), give it a **dedicated event loop** (`esp_event_loop_create`) so it cannot starve other sensors on the shared bus. For presence/temp/lux at normal reporting rates the default shared loop is sufficient.
+For high-throughput sensors (e.g. raw radar frames at 100 Hz), size the queue appropriately or process inline — the handler task will naturally absorb bursts without affecting other components.
 
 ---
 
@@ -79,8 +79,9 @@ If a sensor is high-throughput (e.g. raw radar frames at 100Hz), give it a **ded
 - Parsing the hardware protocol
 - Debouncing (e.g. presence flickering on/off in <100ms)
 - Delta filtering (e.g. only report if temp changed by >0.5°C)
-- Rate limiting (e.g. minimum 1s between events)
+- Rate limiting (e.g. minimum 1s between reports)
 - Maintaining an internal snapshot for `get_latest` polling
+- Calling `xQueueSend()` on meaningful state changes
 
 ### Inside a component ✗ — put this in main
 - Logic that involves more than one sensor ("if sensor_a AND sensor_b detect presence...")
@@ -92,20 +93,19 @@ If a sensor is high-throughput (e.g. raw radar frames at 100Hz), give it a **ded
 
 ## Adding a new sensor component
 
-1. **Copy `base_component`** into `components/<sensor_name>/`
+1. **Copy `uart_component`** into `components/<sensor_name>/`
 
-2. **Rename** every occurrence of `base_comp` / `BASE_COMP` / `base_data_t` to match your sensor:
+2. **Rename** every occurrence of `uart_comp` / `uart_data_t` to match your sensor:
    ```
-   base_comp_*      →  mmwave_comp_*
-   BASE_COMP_EVENTS →  MMWAVE_EVENTS
-   base_data_t      →  mmwave_data_t
+   uart_comp_*   →  mmwave_comp_*
+   uart_data_t   →  mmwave_data_t
    ```
 
 3. **Fill in the header** — update `<sensor>_data_t` with the fields your sensor actually produces:
    ```c
    typedef struct {
-       bool  presence;       // example field
-       float distance_m;     // example field
+       bool     presence;     // example field
+       float    distance_m;   // example field
        uint32_t timestamp;
    } mmwave_data_t;
    ```
@@ -115,25 +115,35 @@ If a sensor is high-throughput (e.g. raw radar frames at 100Hz), give it a **ded
    // 1. Read from hardware (UART/I2C/SPI)
    // 2. Parse and apply filtering (debounce, delta, rate limit)
    // 3. Update internal_data under mutex  (for get_latest polling)
-   // 4. esp_event_post() if conditions are met
+   // 4. xQueueSend() if conditions are met
    ```
 
 5. **Register the component in CMakeLists**:
-   - `components/<sensor_name>/CMakeLists.txt` — already correct if copied from base
+   - `components/<sensor_name>/CMakeLists.txt` — already correct if copied from template
    - `main/CMakeLists.txt` — add `<sensor_name>` to `PRIV_REQUIRES`
 
-6. **Register an event handler in `ps1.c`**:
+6. **Create a queue and init the component in `ps1.c`**:
    ```c
-   // In app_main, after esp_event_loop_create_default():
-   esp_event_handler_register(MMWAVE_EVENTS, MMWAVE_EVENT_DATA_READY, on_mmwave_event, NULL);
+   static QueueHandle_t s_mmwave_queue;
+
+   // In app_main, before zigbee init:
+   s_mmwave_queue = xQueueCreate(4, sizeof(mmwave_data_t));
+   mmwave_comp_init(s_mmwave_queue /*, port, tx_pin, rx_pin */);
    ```
 
-7. **Write the handler in `ps1.c`**:
+7. **Spawn a handler task in `ps1.c`**:
    ```c
-   static void on_mmwave_event(void *arg, esp_event_base_t base, int32_t id, void *event_data) {
-       mmwave_data_t *data = (mmwave_data_t *)event_data;
-       // application logic here
+   static void mmwave_handler_task(void *pv) {
+       mmwave_data_t data;
+       while (1) {
+           if (xQueueReceive(s_mmwave_queue, &data, portMAX_DELAY)) {
+               // application logic here — update Zigbee attributes, fuse with other sensors, etc.
+           }
+       }
    }
+
+   // In app_main:
+   xTaskCreate(mmwave_handler_task, "mmwave_handler", 4096, NULL, 5, NULL);
    ```
 
 ---
