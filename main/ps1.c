@@ -19,7 +19,16 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "ha/esp_zigbee_ha_standard.h"
-#include <driver/gpio.h>
+#include "driver/gpio.h"
+#include "freertos/queue.h"
+#include "driver/uart.h"
+
+#include "test_component.h"
+#include "uart_component.h"
+
+
+#include <iot_button.h>
+#include <button_gpio.h>
 
 #if !defined CONFIG_ZB_ZCZR
 #error Define ZB_ZCZR in idf.py menuconfig to compile light (Router) source code.
@@ -28,38 +37,63 @@
 static bool is_zb_ready = false;
 static const char *TAG = "AMBI_ZB_OCC_SENSOR";
 
+static button_config_t btn_cfg = {
+    .long_press_time = 6000,
+    .short_press_time = 50,
+};
+
+button_gpio_config_t gpio_cfg = {
+    .gpio_num = BOOT_BUTTON_GPIO,
+    .active_level = 0,
+    .enable_power_save = false,
+    .disable_pull = false,
+};
 /********************* Define functions **************************/
 
-static void boot_button_task(void *pv)
-{
-    const TickType_t poll = pdMS_TO_TICKS(25);
-    const uint32_t required_ticks = FACTORY_RESET_LONGPRESS_MS / 25;
-    uint32_t held = 0;
+static QueueHandle_t s_test_comp_queue;
+static QueueHandle_t s_uart_comp_queue;
 
-    gpio_config_t io = {
-        .pin_bit_mask = 1ULL << BOOT_BUTTON_GPIO,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&io);
-
-    ESP_LOGI(TAG, "BOOT long-press enabled: hold %u ms to factory reset", (unsigned)FACTORY_RESET_LONGPRESS_MS);
-
+static void uart_handler_task(void *pv) {
+    test_data_t data;
     while (1) {
-        if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
-            if (++held >= required_ticks) {
-                ESP_LOGW(TAG, "Factory resetting Zigbee state...");
-                esp_zb_factory_reset();
-                vTaskDelay(pdMS_TO_TICKS(100));
-                esp_restart();
-            }
-        } else {
-            held = 0;
+        if (xQueueReceive(s_uart_comp_queue, &data, portMAX_DELAY)) {
+            ESP_LOGI(TAG, "Recieved info from UART");
+            //Based on received data from component, decide what to do with it
         }
-        vTaskDelay(poll);
     }
+}
+
+static void sensor_handler_task(void *pv) {
+    test_data_t data;
+    while (1) {
+        if (xQueueReceive(s_test_comp_queue, &data, portMAX_DELAY)) {
+
+            
+            if(is_zb_ready) {
+                //Set to attribute
+                esp_zb_lock_acquire(portMAX_DELAY);
+            
+                esp_zb_zcl_set_attribute_val(
+                    1,                             // Your defined Endpoint (usually 1)
+                    ESP_ZB_ZCL_CLUSTER_ID_OCCUPANCY_SENSING, // Cluster ID 0x0406
+                    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, 
+                    ESP_ZB_ZCL_ATTR_OCCUPANCY_SENSING_OCCUPANCY_ID, // Attribute 0x0000
+                    &data.presence, 
+                    false
+                );
+
+                esp_zb_lock_release();
+            }
+        }
+    }
+}
+
+/* Factory reset zigbee & restart device */
+static void boot_btn_cb(void *arg,void *usr_data)
+{
+    ESP_LOGW(TAG, "Factory resetting Zigbee state...");
+    //esp_zb_factory_reset();
+    ///esp_restart();
 }
 
 static esp_err_t deferred_driver_init(void)
@@ -225,8 +259,7 @@ static void esp_zb_task(void *pvParameters)
                                       (void *)ESP_MANUFACTURER_NAME);
         esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID,
                                       (void *)ESP_MODEL_IDENTIFIER);
-        esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_POWER_SOURCE_ID,
-                                      (void *)ESP_ZB_ZCL_BASIC_POWER_SOURCE_MAINS_SINGLE_PHASE);
+        // esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_POWER_SOURCE_ID,                                   (void *)ESP_ZB_ZCL_BASIC_POWER_SOURCE_MAINS_SINGLE_PHASE);
         esp_zb_cluster_list_add_basic_cluster(cl, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
         // Occupancy cluster
@@ -258,67 +291,51 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_stack_main_loop();
 }
 
-static void occupancy_toggle_task(void *pvParameters) {
-    uint8_t occupancy = 0; // 0 = Vacant, 1 = Occupied
-
-    // Wait for Zigbee stack to be ready and joined
-    while (!is_zb_ready) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    while(true) {
-        // Toggle the value (if 0, make it 1; if 1, make it 0)
-        occupancy = !occupancy;
-
-        ESP_LOGI(TAG, "Toggling occupancy to: %d", occupancy);
-
-        // Access the Zigbee stack safely
-        esp_zb_lock_acquire(portMAX_DELAY);
-        
-        esp_zb_zcl_set_attribute_val(
-            1,                             // Your defined Endpoint (usually 1)
-            ESP_ZB_ZCL_CLUSTER_ID_OCCUPANCY_SENSING, // Cluster ID 0x0406
-            ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, 
-            ESP_ZB_ZCL_ATTR_OCCUPANCY_SENSING_OCCUPANCY_ID, // Attribute 0x0000
-            &occupancy, 
-            false
-        );
-
-        esp_zb_zcl_attr_t *attr = esp_zb_zcl_get_attribute(
-            1,
-            ESP_ZB_ZCL_CLUSTER_ID_OCCUPANCY_SENSING,
-            ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-            ESP_ZB_ZCL_ATTR_OCCUPANCY_SENSING_OCCUPANCY_ID
-        );
-        if (attr) {
-            ESP_LOGI(TAG, "Attribute value confirmed: %d", *(uint8_t *)attr->data_p);
-        } else {
-            ESP_LOGE(TAG, "Attribute not found! Cluster not registered correctly.");
-        }
-
-        esp_zb_lock_release();
-
-        // Wait 15 seconds
-        vTaskDelay(pdMS_TO_TICKS(15000));
-    }
-}
-
 void app_main(void)
 {
-    ESP_LOGI("STARTUP", "AMBI SENSOR BOOTING...");
+    ESP_LOGI(TAG, "AMBI SENSOR BOOTING...");
+
+     /* Initialize NVS partition */
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to init NVS");
+        return;
+    }
+
+    /* Zigbee */
     esp_zb_platform_config_t config = {
-        .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
-        .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
+       .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
+       .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
     };
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
-    //zigbee
+
     xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
 
-    //boot button
-    xTaskCreate(boot_button_task, "ambi_boot_btn", 2048, NULL, 4, NULL);
+    /* Boot button */
+    button_handle_t gpio_btn;
+    esp_err_t btn_ret = iot_button_new_gpio_device(&btn_cfg, &gpio_cfg, &gpio_btn);
+    if (btn_ret == ESP_OK) {
+        iot_button_register_cb(gpio_btn, BUTTON_LONG_PRESS_UP, NULL, boot_btn_cb, NULL);
+    } else {
+        ESP_LOGW(TAG, "Boot button created failed");
+    }
 
-    //occupancy
-    xTaskCreate(occupancy_toggle_task, "occ_toggle", 4096, NULL, 5, NULL);
+    //Initial Test Component
+    s_test_comp_queue = xQueueCreate(10, sizeof(test_data_t));
+    test_comp_init(s_test_comp_queue);
+    xTaskCreate(sensor_handler_task, "sensor_handler", 2048, NULL, 5, NULL);
+
+    // Sample uart component
+    // Init queue for the component
+    //s_uart_comp_queue = xQueueCreate(10, sizeof(uart_data_t));
+    // Init component, pass in the queue so that it knows where to send OUTPUT to
+    //uart_component_init(UART_NUM_0, s_uart_comp_queue, 20, 21);
+    //xTaskCreate(uart_handler_task, "uart_handler", 2048, NULL, 5, NULL);
+
 }
+

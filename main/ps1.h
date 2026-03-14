@@ -14,6 +14,7 @@
 
 #include "esp_zigbee_core.h"
 #include "light_driver.h"
+#include "esp_err.h"
 
 /* Zigbee configuration */
 #define MAX_CHILDREN                      10                                    /* the max amount of connected devices */
@@ -46,3 +47,7 @@
     {                                                           \
         .host_connection_mode = ZB_HOST_CONNECTION_MODE_NONE,   \
     }
+
+
+esp_err_t app_wifi_init(void);
+esp_err_t app_wifi_start(void);

@@ -3,7 +3,7 @@
 **/sdkconfig
 **/sdkconfig.old
 **/managed_components
-
+git re
 # Editor/IDE specific files
 .vscode/
 .idea/
